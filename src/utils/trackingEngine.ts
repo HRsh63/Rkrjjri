@@ -98,7 +98,7 @@ export class SARTrackingEngine {
    * Primary detection update (called every time neural network yields bounding boxes)
    */
   public update(
-    detections: RawDetection[],
+    rawDetections: RawDetection[],
     uavTelemetry: {
       altitudeM: number;
       headingDeg: number;
@@ -110,7 +110,23 @@ export class SARTrackingEngine {
     humanIdEnabled = true
   ): TrackedSARObject[] {
     const now = Date.now();
+
+    // 0. Non-Maximum Suppression (NMS) to eliminate duplicate/overlapping boxes
+    const detections: RawDetection[] = [];
+    const sortedRaw = [...rawDetections].sort((a, b) => b.score - a.score);
+    for (const d of sortedRaw) {
+      let suppressed = false;
+      for (const keep of detections) {
+        if (d.cls === keep.cls && computeIoU(d, keep) > 0.45) {
+          suppressed = true;
+          break;
+        }
+      }
+      if (!suppressed) detections.push(d);
+    }
+
     const matchedDets = new Set<number>();
+    const matchedTracks = new Set<number>();
     const updatedTracks: TrackedSARObject[] = [];
 
     // 1. Predict track position forward using existing velocity
@@ -122,14 +138,13 @@ export class SARTrackingEngine {
       return { ...tr, predX, predY, predCx, predCy };
     });
 
-    // 2. Compute cost and match using IoU + normalized distance
-    for (const tr of predictedTracks) {
-      let bestScore = -1;
-      let bestIdx = -1;
-
-      for (let i = 0; i < detections.length; i++) {
-        if (matchedDets.has(i)) continue;
-        const det = detections[i];
+    // 2. Compute cost matrix for all Track-Detection pairs
+    const assignments: { tIdx: number; dIdx: number; score: number }[] = [];
+    
+    for (let t = 0; t < predictedTracks.length; t++) {
+      for (let d = 0; d < detections.length; d++) {
+        const tr = predictedTracks[t];
+        const det = detections[d];
 
         // Class must match (or both must be general object if low conf)
         const classMatch = det.cls === tr.cls;
@@ -154,110 +169,123 @@ export class SARTrackingEngine {
           score = Math.max(0, 1.0 - distNorm / 2.5);
         }
 
-        if (score > bestScore && score > 0.2) {
-          bestScore = score;
-          bestIdx = i;
+        if (score > 0.2) {
+          assignments.push({ tIdx: t, dIdx: d, score });
+        }
+      }
+    }
+
+    // Sort assignments globally by highest score (Global Greedy Assignment)
+    assignments.sort((a, b) => b.score - a.score);
+
+    // 3. Process matches globally
+    for (const match of assignments) {
+      if (matchedTracks.has(match.tIdx) || matchedDets.has(match.dIdx)) continue;
+      
+      matchedTracks.add(match.tIdx);
+      matchedDets.add(match.dIdx);
+
+      const tr = predictedTracks[match.tIdx];
+      const det = detections[match.dIdx];
+
+      // Kalman-like Exponential Moving Average (EMA) smoothing for coordinates
+      const alphaPos = 0.65; // Position smoothing
+      const alphaSize = 0.5; // Size smoothing
+      const smoothedX = tr.x * (1 - alphaPos) + det.x * alphaPos;
+      const smoothedY = tr.y * (1 - alphaPos) + det.y * alphaPos;
+      const smoothedW = tr.w * (1 - alphaSize) + det.w * alphaSize;
+      const smoothedH = tr.h * (1 - alphaSize) + det.h * alphaSize;
+      const smoothedCx = smoothedX + smoothedW / 2;
+      const smoothedCy = smoothedY + smoothedH / 2;
+
+      // Instantaneous displacement
+      const measuredVx = smoothedCx - tr.cx;
+      const measuredVy = smoothedCy - tr.cy;
+
+      // Velocity filter (alpha = 0.6)
+      const vx = tr.vx * 0.4 + measuredVx * 0.6;
+      const vy = tr.vy * 0.4 + measuredVy * 0.6;
+      const speed = Math.hypot(vx, vy);
+
+      // History trail
+      const newHistory = [...tr.history, { x: smoothedCx, y: smoothedCy, time: now }];
+      if (newHistory.length > this.maxHistoryLen) {
+        newHistory.shift();
+      }
+
+      // Posture Analysis for Human SAR
+      const isPerson = det.cls === 'person';
+      const aspectRatio = smoothedH / Math.max(1, smoothedW);
+      let posture: PostureType = 'unknown';
+      if (isPerson) {
+        if (aspectRatio >= 1.35) {
+          posture = 'standing';
+        } else if (aspectRatio >= 0.75) {
+          posture = 'crouched';
+        } else {
+          posture = 'prone'; // Critical search & rescue indicator!
         }
       }
 
-      if (bestIdx !== -1) {
-        matchedDets.add(bestIdx);
-        const det = detections[bestIdx];
-
-        // Kalman-like Exponential Moving Average (EMA) smoothing for coordinates
-        const alphaPos = 0.65; // Position smoothing
-        const alphaSize = 0.5; // Size smoothing
-        const smoothedX = tr.x * (1 - alphaPos) + det.x * alphaPos;
-        const smoothedY = tr.y * (1 - alphaPos) + det.y * alphaPos;
-        const smoothedW = tr.w * (1 - alphaSize) + det.w * alphaSize;
-        const smoothedH = tr.h * (1 - alphaSize) + det.h * alphaSize;
-        const smoothedCx = smoothedX + smoothedW / 2;
-        const smoothedCy = smoothedY + smoothedH / 2;
-
-        // Instantaneous displacement
-        const measuredVx = smoothedCx - tr.cx;
-        const measuredVy = smoothedCy - tr.cy;
-
-        // Velocity filter (alpha = 0.6)
-        const vx = tr.vx * 0.4 + measuredVx * 0.6;
-        const vy = tr.vy * 0.4 + measuredVy * 0.6;
-        const speed = Math.hypot(vx, vy);
-
-        // History trail
-        const newHistory = [...tr.history, { x: smoothedCx, y: smoothedCy, time: now }];
-        if (newHistory.length > this.maxHistoryLen) {
-          newHistory.shift();
+      // Vitality & Movement Dwell
+      let vitality: VitalityType = 'active';
+      let stationaryDur = tr.stationaryDurationSec;
+      if (speed < 0.4) {
+        stationaryDur += (now - tr.lastSeen) / 1000;
+        if (stationaryDur > 3.5) {
+          vitality = 'stationary';
         }
-
-        // Posture Analysis for Human SAR
-        const isPerson = det.cls === 'person';
-        const aspectRatio = smoothedH / Math.max(1, smoothedW);
-        let posture: PostureType = 'unknown';
-        if (isPerson) {
-          if (aspectRatio >= 1.35) {
-            posture = 'standing';
-          } else if (aspectRatio >= 0.75) {
-            posture = 'crouched';
-          } else {
-            posture = 'prone'; // Critical search & rescue indicator!
-          }
-        }
-
-        // Vitality & Movement Dwell
-        let vitality: VitalityType = 'active';
-        let stationaryDur = tr.stationaryDurationSec;
-        if (speed < 0.4) {
-          stationaryDur += (now - tr.lastSeen) / 1000;
-          if (stationaryDur > 3.5) {
-            vitality = 'stationary';
-          }
-        } else if (speed > 4.0) {
-          vitality = 'rapid';
-          stationaryDur = 0;
-        } else {
-          vitality = 'active';
-          stationaryDur = 0;
-        }
-
-        // SAR Telemetry Estimation
-        const sarMetrics = this.computeSARMetrics(
-          smoothedCx,
-          smoothedCy,
-          smoothedH,
-          uavTelemetry,
-          isPerson
-        );
-
-        updatedTracks.push({
-          ...tr,
-          x: smoothedX,
-          y: smoothedY,
-          w: smoothedW,
-          h: smoothedH,
-          cx: smoothedCx,
-          cy: smoothedCy,
-          vx,
-          vy,
-          speedPxPerSec: speed * 30,
-          score: Math.max(tr.score * 0.2 + det.score * 0.8, det.score),
-          history: newHistory,
-          lostFrames: 0,
-          totalFrames: tr.totalFrames + 1,
-          lastSeen: now,
-          coasting: false,
-          isPerson,
-          posture,
-          vitality,
-          stationaryDurationSec: stationaryDur,
-          estDistanceM: sarMetrics.distanceM,
-          estBearingDeg: sarMetrics.bearingDeg,
-          estGpsLat: sarMetrics.lat,
-          estGpsLon: sarMetrics.lon,
-          heatDeltaC: isPerson ? (tr.heatDeltaC || 3.2 + (Math.sin(tr.id) * 0.8)) : 0,
-          label: det.label || tr.label,
-        });
+      } else if (speed > 4.0) {
+        vitality = 'rapid';
+        stationaryDur = 0;
       } else {
-        // Track missed in this frame: Coast with momentum if within limit
+        vitality = 'active';
+        stationaryDur = 0;
+      }
+
+      // SAR Telemetry Estimation
+      const sarMetrics = this.computeSARMetrics(
+        smoothedCx,
+        smoothedCy,
+        smoothedH,
+        uavTelemetry,
+        isPerson
+      );
+
+      updatedTracks.push({
+        ...tr,
+        x: smoothedX,
+        y: smoothedY,
+        w: smoothedW,
+        h: smoothedH,
+        cx: smoothedCx,
+        cy: smoothedCy,
+        vx,
+        vy,
+        speedPxPerSec: speed * 30,
+        score: Math.max(tr.score * 0.2 + det.score * 0.8, det.score),
+        history: newHistory,
+        lostFrames: 0,
+        totalFrames: tr.totalFrames + 1,
+        lastSeen: now,
+        coasting: false,
+        isPerson,
+        posture,
+        vitality,
+        stationaryDurationSec: stationaryDur,
+        estDistanceM: sarMetrics.distanceM,
+        estBearingDeg: sarMetrics.bearingDeg,
+        estGpsLat: sarMetrics.lat,
+        estGpsLon: sarMetrics.lon,
+        heatDeltaC: isPerson ? (tr.heatDeltaC || 3.2 + (Math.sin(tr.id) * 0.8)) : 0,
+        label: det.label || tr.label,
+      });
+    }
+
+    // 2.5 Handle unmatched tracks (Occlusion / Coasting / Dead Reckoning)
+    for (let t = 0; t < predictedTracks.length; t++) {
+      if (!matchedTracks.has(t)) {
+        const tr = predictedTracks[t];
         if (tr.lostFrames < this.maxLostFrames) {
           const coastX = tr.x + tr.vx * 0.85;
           const coastY = tr.y + tr.vy * 0.85;

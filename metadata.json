@@ -1,0 +1,6 @@
+{
+  "name": "SAR-UAV Ground Control",
+  "description": "SAR-UAV Ground Control console with clean video feed, onboard human identification, object tracking, military target lock, and live phone telemetry in g and cm.",
+  "requestFramePermissions": ["camera", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
